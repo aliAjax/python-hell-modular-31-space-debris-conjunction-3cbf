@@ -34,10 +34,17 @@ class WorkflowTest(unittest.TestCase):
         item = self.service.act(item["id"], "assess", {"hours_to_tca": 18}, "analyst-1", "analyst", item["version"])
         self.assertEqual(item["status"], "assessed")
         self.assertEqual(item["payload"]["assessment"]["level"], "high")
+        # 全部运营方确认之前，规避动作停在待确认状态
         item = self.service.act(item["id"], "approve", {
             "fuel_cost_m_s": 2.5,
             "maneuver_window": "2026-09-28T08:00:00Z/2026-09-28T09:00:00Z",
         }, "coordinator-1", "coordinator", item["version"])
+        self.assertEqual(item["status"], "pending_confirmation")
+        self.assertEqual(len(item["payload"]["pending_confirmation"]["pending"]), 2)
+        # 所有运营方确认后放行
+        item = self.service.act(item["id"], "record_opinion", {"operator": "Org-A", "opinion": "approve"}, "operator-1", "operator", item["version"])
+        self.assertEqual(item["status"], "pending_confirmation")
+        item = self.service.act(item["id"], "record_opinion", {"operator": "Org-B", "opinion": "approve"}, "operator-1", "operator", item["version"])
         self.assertEqual(item["status"], "coordinating")
         item = self.service.act(item["id"], "execute", {"command_ref": "CMD-7"}, "operator-1", "operator", item["version"])
         item = self.service.act(item["id"], "resolve", {"report_ref": "RPT-7"}, "coordinator-1", "coordinator", item["version"])

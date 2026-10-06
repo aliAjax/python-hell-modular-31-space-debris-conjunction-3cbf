@@ -46,6 +46,7 @@ class Repository:
                     payload TEXT NOT NULL,
                     observed_at TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
                     UNIQUE(item_id, source_type, external_id),
                     FOREIGN KEY(item_id) REFERENCES items(id)
                 );
@@ -72,6 +73,12 @@ class Repository:
                 );
                 """
             )
+            # 兼容旧库：补充 updated_at 列
+            try:
+                conn.execute("ALTER TABLE sources ADD COLUMN updated_at TEXT")
+                conn.execute("UPDATE sources SET updated_at=created_at WHERE updated_at IS NULL")
+            except sqlite3.OperationalError:
+                pass
         finally:
             conn.close()
 
@@ -160,31 +167,54 @@ class Repository:
         finally:
             conn.close()
 
-    def add_source(self, item_id, source_type, external_id, payload, observed_at, actor, role):
+    def upsert_source(self, item_id, source_type, external_id, payload, observed_at, actor, role):
+        """按来源标识写入最新观测（幂等 upsert）。
+
+        同一 (item_id, source_type, external_id) 只保留最新一条；内容不变时不更新、
+        不 bump 版本，并发重复提交结果一致。返回 (source, changed)。
+        """
         conn = self.connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             item = conn.execute("SELECT id FROM items WHERE id=?", (item_id,)).fetchone()
             if item is None:
                 raise NotFoundError("item_not_found", "业务实体不存在")
-            try:
-                conn.execute(
-                    "INSERT INTO sources(item_id,source_type,external_id,payload,observed_at,created_at) VALUES(?,?,?,?,?,?)",
-                    (item_id, source_type, external_id, canonical_json(payload), observed_at, now_iso()),
-                )
-            except sqlite3.IntegrityError:
-                raise ConflictError("duplicate_source", "同一来源记录已经提交")
-            source_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
-            self.append_audit(
-                conn,
-                item_id,
-                "source_recorded",
-                actor,
-                role,
-                {"source_id": source_id, "source_type": source_type, "external_id": external_id},
+            now = now_iso()
+            cur = conn.execute(
+                """INSERT INTO sources(item_id,source_type,external_id,payload,observed_at,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?)
+                   ON CONFLICT(item_id,source_type,external_id) DO UPDATE SET
+                     payload=excluded.payload,
+                     observed_at=excluded.observed_at,
+                     updated_at=excluded.updated_at
+                   WHERE sources.payload IS NOT excluded.payload
+                      OR sources.observed_at IS NOT excluded.observed_at""",
+                (item_id, source_type, external_id, canonical_json(payload), observed_at, now, now),
             )
+            changed = cur.rowcount
+            row = conn.execute(
+                "SELECT * FROM sources WHERE item_id=? AND source_type=? AND external_id=?",
+                (item_id, source_type, external_id),
+            ).fetchone()
+            source = dict(row)
+            source["payload"] = json.loads(source["payload"])
+            source["changed"] = bool(changed)
+            if changed:
+                self.append_audit(
+                    conn,
+                    item_id,
+                    "source_recorded",
+                    actor,
+                    role,
+                    {
+                        "source_id": source["id"],
+                        "source_type": source_type,
+                        "external_id": external_id,
+                        "updated": changed,
+                    },
+                )
             conn.execute("COMMIT")
-            return {"id": source_id, "item_id": item_id, "source_type": source_type, "external_id": external_id, "payload": payload, "observed_at": observed_at}
+            return source, bool(changed)
         except Exception:
             try:
                 conn.execute("ROLLBACK")

@@ -2,6 +2,7 @@ from .domain import DomainError
 
 ENTITY_TYPE = "space_conjunction"
 INITIAL_STATUS = "pending"
+STATUS_PENDING_CONFIRMATION = "pending_confirmation"
 CREATE_ROLES = {"analyst"}
 SOURCE_ROLES = {"analyst", "operator"}
 ACTION_ROLES = {
@@ -12,10 +13,11 @@ ACTION_ROLES = {
     "resolve": {"coordinator"},
     "cancel": {"coordinator"},
     "report_revision": {"analyst"},
+    "reconcile": {"analyst"},
 }
 ENFORCE_REGION = False
 REGION_SENSITIVE_ACTIONS = set()
-ACTION_REQUIRES_VERSION = {"approve", "execute", "resolve", "cancel"}
+ACTION_REQUIRES_VERSION = {"approve", "execute", "resolve", "cancel", "reconcile"}
 
 
 def assess(payload):
@@ -31,6 +33,105 @@ def assess(payload):
     else:
         level = "low"
     return {"score": score, "level": level, "distance_to_covariance_ratio": round(ratio, 3)}
+
+
+def _source_observation(source):
+    payload = source.get("payload") if isinstance(source.get("payload"), dict) else source
+    distance = float(payload.get("miss_distance_m", source.get("miss_distance_m", 0)))
+    covariance = float(payload.get("covariance_m", source.get("covariance_m", 0)))
+    observed_at = source.get("observed_at") or payload.get("observed_at") or ""
+    return str(observed_at), distance, covariance
+
+
+def reconcile_sources(sources):
+    """按来源标识取最新观测，返回对账后的 (miss_distance_m, covariance_m)。
+
+    同一来源标识只保留最新一条；全局以最新 observed_at 的观测为准。
+    没有任何来源时返回 None，沿用业务记录自身的初始值。
+    """
+    if not sources:
+        return None
+    latest_by_key = {}
+    for source in sources:
+        key = (source.get("source_type"), source.get("external_id"))
+        observed_at, _, _ = _source_observation(source)
+        rank = (observed_at, source.get("id", 0))
+        current = latest_by_key.get(key)
+        if current is None or rank > current[0]:
+            latest_by_key[key] = (rank, source)
+    candidates = [entry[1] for entry in latest_by_key.values()]
+    best = max(candidates, key=lambda item: (item.get("observed_at") or "", item.get("id", 0)))
+    _, distance, covariance = _source_observation(best)
+    if covariance <= 0:
+        raise DomainError("reconcile_failed", "最新观测的协方差无效，无法重算风险评估")
+    return distance, covariance
+
+
+def reconcile_payload(payload, sources):
+    """从来源记录重算距离/协方差与风险评估。
+
+    重算失败时保留来源记录，把评估标记为失效；来源记录持久存在，可再次重算恢复。
+    返回 (new_payload, error)。
+    """
+    new_payload = dict(payload)
+    error = None
+    try:
+        reconciled = reconcile_sources(sources)
+        if reconciled is not None:
+            distance, covariance = reconciled
+            new_payload["miss_distance_m"] = distance
+            new_payload["covariance_m"] = covariance
+        result = assess(new_payload)
+        new_payload["assessment"] = result
+        new_payload["assessment_stale"] = False
+    except DomainError as exc:
+        new_payload["assessment"] = None
+        new_payload["assessment_stale"] = True
+        error = exc
+    if sources:
+        for entry in new_payload.get("opinions", []):
+            entry["stale"] = True
+    return new_payload, error
+
+
+def _latest_opinions_by_operator(current):
+    latest = {}
+    for entry in current.get("opinions", []):
+        latest[entry["operator"]] = entry
+    return latest
+
+
+def _has_conflict(current):
+    latest = _latest_opinions_by_operator(current)
+    return any(
+        entry.get("opinion") in {"reject", "request_review"} and not entry.get("stale")
+        for entry in latest.values()
+    )
+
+
+def _confirmed_operators(current):
+    orgs = current.get("operating_organizations", [])
+    latest = _latest_opinions_by_operator(current)
+    return [
+        org
+        for org in orgs
+        if org in latest
+        and latest[org].get("opinion") == "approve"
+        and not latest[org].get("stale")
+    ]
+
+
+def _all_operators_confirmed(current):
+    orgs = current.get("operating_organizations", [])
+    if not orgs:
+        return True
+    return len(_confirmed_operators(current)) == len(orgs)
+
+
+def _pending_operators(current):
+    orgs = current.get("operating_organizations", [])
+    confirmed = set(_confirmed_operators(current))
+    return [org for org in orgs if org not in confirmed]
 
 
 def _need_status(item, allowed):
@@ -67,6 +168,9 @@ def apply_action(item, action, payload, actor, role):
         current["hours_to_tca"] = float(payload.get("hours_to_tca", current.get("hours_to_tca", 24)))
         result = assess(current)
         current["assessment"] = result
+        current["assessment_stale"] = False
+        for entry in current.get("opinions", []):
+            entry["stale"] = True
         return "assessed", current, {"assessment": result, "actor": actor}
 
     if action == "report_revision":
@@ -83,23 +187,30 @@ def apply_action(item, action, payload, actor, role):
         current["miss_distance_m"] = revision["miss_distance_m"]
         current["covariance_m"] = revision["covariance_m"]
         current["assessment"] = assess(current)
+        current["assessment_stale"] = False
+        for entry in current.get("opinions", []):
+            entry["stale"] = True
         return status, current, {"revision": revision}
 
     if action == "record_opinion":
-        _need_status(item, {"assessed", "coordinating"})
+        _need_status(item, {"assessed", "coordinating", STATUS_PENDING_CONFIRMATION})
         opinion = _require_text(payload, "opinion").lower()
         if opinion not in {"approve", "reject", "request_review"}:
             raise DomainError("invalid_opinion", "意见必须是 approve、reject 或 request_review")
         operator = _require_text(payload, "operator")
-        entry = {"operator": operator, "opinion": opinion, "reason": payload.get("reason", "")}
+        entry = {"operator": operator, "opinion": opinion, "reason": payload.get("reason", ""), "stale": False}
         current.setdefault("opinions", []).append(entry)
-        if opinion in {"reject", "request_review"}:
-            current["conflict"] = True
+        current["conflict"] = _has_conflict(current)
+        if status == STATUS_PENDING_CONFIRMATION and _all_operators_confirmed(current) and not current["conflict"]:
+            current.pop("pending_confirmation", None)
+            return "coordinating", current, {"opinion": entry, "auto_released": True}
         return status, current, {"opinion": entry}
 
     if action == "approve":
-        _need_status(item, {"assessed"})
-        if current.get("conflict"):
+        _need_status(item, {"assessed", STATUS_PENDING_CONFIRMATION})
+        if current.get("assessment_stale"):
+            raise DomainError("assessment_stale", "风险评估已失效，请先重算")
+        if _has_conflict(current):
             raise DomainError("unresolved_conflict", "存在未解决的运营方冲突意见", 409)
         fuel = _require_number(payload, "fuel_cost_m_s", 0)
         budget = float(current.get("fuel_budget_m_s", 0))
@@ -107,7 +218,13 @@ def apply_action(item, action, payload, actor, role):
             raise DomainError("fuel_budget_exceeded", "规避燃料超过预算", 409)
         window = _require_text(payload, "maneuver_window")
         current["approved_maneuver"] = {"fuel_cost_m_s": fuel, "maneuver_window": window}
-        return "coordinating", current, {"approved_maneuver": current["approved_maneuver"]}
+        if _all_operators_confirmed(current):
+            current.pop("pending_confirmation", None)
+            return "coordinating", current, {"approved_maneuver": current["approved_maneuver"]}
+        confirmed = _confirmed_operators(current)
+        pending = _pending_operators(current)
+        current["pending_confirmation"] = {"confirmed": confirmed, "pending": pending}
+        return STATUS_PENDING_CONFIRMATION, current, {"pending_confirmation": current["pending_confirmation"]}
 
     if action == "execute":
         _need_status(item, {"coordinating"})
