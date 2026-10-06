@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="zh-CN"><meta charset="utf-8"><title>太空碎片接近协调</title>
-<body><h1>太空碎片接近预警与规避协调</h1><p>服务已启动。使用 JSON API 创建接近事件、记录来源、执行评估和协调动作。</p><pre>GET /health
+<body><h1>太空碎片接近预警与规避协调</h1><p>服务已启动。来源记录先对账（按来源标识取最新、精度加权融合），任一来源变化即让风险评估/运营方意见/规避动作失效并重算；重算失败可用 recover_assessment 从来源记录恢复；全部运营方 approve 前规避动作停在 maneuver_pending。</p><pre>GET /health
 GET /api/state
 POST /api/items
-POST /api/items/{id}/sources
-POST /api/items/{id}/actions</pre></body></html>
+POST /api/items/{id}/sources            # 201 新观测 / 200 重复幂等 / 409 旧观测或冲突
+POST /api/items/{id}/actions            # assess|approve|record_opinion|execute|resolve|cancel|report_revision|recover_assessment</pre></body></html>

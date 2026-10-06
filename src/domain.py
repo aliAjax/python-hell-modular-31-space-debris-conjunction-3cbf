@@ -60,6 +60,18 @@ def parse_timestamp(payload, name):
     return value
 
 
+def normalize_iso_utc(value):
+    """把 ISO 时间统一成 UTC 的朴素 ISO 形式（naive 视为 UTC），保证可按字符串比较。"""
+    from datetime import timezone
+
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    base = dt.strftime("%Y-%m-%dT%H:%M:%S")
+    return "%s.%06d" % (base, dt.microsecond) if dt.microsecond else base
+
+
 def normalize_create(payload):
     primary = require_text(payload, "primary_object_id")
     secondary = require_text(payload, "secondary_object_id")
@@ -88,6 +100,8 @@ def normalize_create(payload):
         "revisions": [],
         "opinions": [],
         "conflict": False,
+        "assessment_state": None,
+        "source_fingerprint": None,
         "_stable_key": stable_key,
     }
 
@@ -106,7 +120,7 @@ def normalize_source(payload):
     return {
         "source_type": source_type,
         "external_id": external_id,
-        "observed_at": observed_at,
+        "observed_at": normalize_iso_utc(observed_at),
         "miss_distance_m": distance,
         "covariance_m": covariance,
         "region": region,
